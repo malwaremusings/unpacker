@@ -2,7 +2,7 @@
 # Python script to attempt automatic unpacking/decrypting of #
 # malware samples using WinAppDbg.                           #
 #                                                            #
-# unpack.py v2013.02.26                                      #
+# unpack.py v2014.06.21                                      #
 # http://malwaremusings.com/scripts/unpack.py                #
 ##############################################################
 
@@ -15,6 +15,9 @@ import winappdbg
 logfile = None
 
 class MyEventHandler(winappdbg.EventHandler):
+
+	#exportdirs = {}
+	exportdirrdaddrs = {}
 
 ###
 # A. Declaring variables
@@ -84,6 +87,16 @@ class MyEventHandler(winappdbg.EventHandler):
 	apiHooks = {
 		"kernel32.dll":[
 			("VirtualAllocEx",5),
+		],
+		"advapi32.dll":[
+			("CryptDecrypt",6)
+		],
+		"wininet.dll":[
+			("InternetOpenA",5),
+			("InternetOpenW",5)
+		],
+		"ntdll.dll":[
+			("RtlDecompressBuffer",6)
 		]
 	}
 
@@ -154,6 +167,64 @@ class MyEventHandler(winappdbg.EventHandler):
 			raise
 
 
+	# C.3
+	# CryptDecrypt() hook(s)
+	#
+
+	def pre_CryptDecrypt(self,event,*args):
+		(ra,(hKey,hHash,Final,dwFlags,pbData,pdwDataLen)) = self.get_funcargs(event)
+
+		p = event.get_process()
+		buffsize = p.read_uint(pdwDataLen)
+
+		#
+		# save a copy of the encrypted data
+		#
+		filename = "%s.memblk0x%x.enc" % (sys.argv[1],pbData)
+		log("[-]    Dumping %d bytes of encrypted memory at 0x%x to %s" % (buffsize,pbData,filename))
+		databuff = open(filename,"wb")
+		databuff.write(p.read(pbData,buffsize));
+		databuff.close()
+
+
+	def post_CryptDecrypt(self,event,retval):
+		(ra,(hKey,hHash,Final,dwFlags,pbData,pdwDataLen)) = self.get_funcargs(event)
+
+		p = event.get_process()
+		buffsize = p.read_uint(pdwDataLen)
+
+		#
+		# save a copy of the decrypted data
+		#
+		filename = "%s.memblk0x%x.dec" % (sys.argv[1],pbData)
+		log("[-]    Dumping %d bytes of decrypted memory at 0x%x to %s" % (buffsize,pbData,filename))
+		databuff = open(filename,"wb")
+		databuff.write(p.read(pbData,buffsize))
+		databuff.close()
+
+	# C.4
+	# InternetOpen*() hook(s)
+	#
+
+	def post_InternetOpen(self,event,retval,fUnicode):
+		(ra,(lpszAgent,dwAccessType,lpszProxyName,lpszProxyBypass,dwFlags)) = self.get_funcargs(event)
+
+		p = event.get_process()
+		szAgent = p.peek_string(lpszAgent,fUnicode) + "\0"
+		szProxyName = p.peek_string(lpszProxyName,fUnicode) + "\0"
+		szProxyBypass = p.peek_string(lpszProxyBypass,fUnicode) + "\0"
+
+		log("[*] <%d:%d> 0x%x: InternetOpen(\"%s\",0x%x,\"%s\",\"%s\",0x%x) = 0x%x" % (pid,tid,ra,szAgent,dwAccessType,szProxyName,szProxyBypass,dwFlags,retval))
+
+
+	def post_InternetOpenA(self,event,retval):
+		post_InternetOpen(event,retval,False)
+
+
+	def post_InternetOpenW(self,event,retval):
+		post_InternetOpen(event,retval,True)
+
+
 ###
 # D. winappdbg debug event handlers
 ###
@@ -194,6 +265,34 @@ class MyEventHandler(winappdbg.EventHandler):
 		log("[*] Create thread event")
 
 
+	### D.x
+	# membp_exportdir
+	#
+	###
+
+	def membp_exportdir(self,exception):
+		e_addr = exception.get_exception_address()
+		f_addr = exception.get_fault_address()
+		f_type = exception.get_fault_type()
+
+		if (f_type == winappdbg.win32.EXCEPTION_READ_FAULT):
+			if not e_addr in self.exportdirrdaddrs:
+				p = exception.get_process()
+				e_label = p.get_label_at_address(e_addr)
+
+				if (not e_label.startswith("ntdll!")):
+					t = exception.get_thread()
+					instr = t.disassemble_instruction(e_addr)[2].lower()
+					log("[*] Memory breakpoint (0x%x) on export directory address 0x%x referenced from 0x%x (%s)" % (f_type,f_addr,e_addr,instr))
+					self.exportdirrdaddrs[e_addr] = instr
+				else:
+					self.exportdirrdaddrs[e_addr] = "<ntdll>"
+
+
+	#def guard_page(self,exception):
+	#	log("[*] guard_page: 0x%x" % event.get_event_code())
+
+
 	### D.4
 	# load_dll
 	#
@@ -201,7 +300,45 @@ class MyEventHandler(winappdbg.EventHandler):
 	###
 
 	def load_dll(self,event):
-		log("[*] Load DLL")
+		try:
+			log("[*] Load DLL: %s" % event.get_filename())
+
+			baseaddr = event.get_module_base()
+			p = event.get_process()
+			if (event.get_filename().endswith("ntdll.dll")):
+				m = event.get_module()
+				modsize = m.get_size()
+				self.ntdll = (baseaddr,modsize)
+
+			lfa_new = baseaddr + p.read_uint(baseaddr + 0x3c)
+			log("[D]    lfa_new: 0x%x" % lfa_new)
+			export_diraddr = baseaddr + p.read_uint(lfa_new + 0x78)
+			export_dirsize = p.read_uint(lfa_new + 0x78 + 0x04)
+			export_numofnames = p.read_uint(export_diraddr + 0x18)
+			export_addressofnames = baseaddr + p.read_uint(export_diraddr + 0x20)
+
+			log("[D]    BaseAddress: 0x%x" % baseaddr)
+			log("[D]    NumberOfNames: %d" % export_numofnames)
+			log("[D]    AddressOfNames: 0x%x" % export_addressofnames)
+
+			for i in range(0,export_numofnames - 1):
+				export_nameaddr = baseaddr + p.read_uint(export_addressofnames + (i * 4))
+				export_name = p.peek_string(export_nameaddr) + "\0"
+				log("[-]     0x%x: %s" % (export_nameaddr,export_name))
+
+			d = event.debug
+			pid = event.get_pid()
+
+			firstname = baseaddr + p.read_uint(export_addressofnames)
+			endofnames = export_diraddr + export_dirsize
+			nameslen = endofnames - firstname + 1
+		
+			log("[D]    Setting breakpoint for 0x%x - 0x%x (0x%x bytes)" % (firstname,endofnames,nameslen))
+			#self.exportdirs[(firstname,nameslen)] = event.get_filename()
+			d.watch_buffer(pid,firstname,nameslen,self.membp_exportdir)
+		except:
+			traceback.print_exc()
+			raise
 
 
 	### D.5
@@ -380,6 +517,8 @@ def log(msg):
 	if logfile:
 		logfile.write(msg + "\n")
 		logfile.flush()
+
+	#logfile.log_text(msg)
 
 
 ### F.2
