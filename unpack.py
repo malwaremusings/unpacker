@@ -2,22 +2,20 @@
 # Python script to attempt automatic unpacking/decrypting of #
 # malware samples using WinAppDbg.                           #
 #                                                            #
-# unpack.py v2014.06.21                                      #
+# unpack.py v2014.06.23                                      #
 # http://malwaremusings.com/scripts/unpack.py                #
 ##############################################################
 
 import sys
 import traceback
 import winappdbg
+import datetime
 
 
 # Log file which we log info to
 logfile = None
 
 class MyEventHandler(winappdbg.EventHandler):
-
-	#exportdirs = {}
-	exportdirrdaddrs = {}
 
 ###
 # A. Declaring variables
@@ -53,6 +51,21 @@ class MyEventHandler(winappdbg.EventHandler):
 	writeaddrs = {}
 
 
+	#
+	# variables used to find export symbols
+	#
+
+	ntbrkpthit = False
+	exportednames = {0x00000000:"invalid"}
+	exportdirrdaddrs = {}
+	exportdirs = {}
+	currsym = 0
+	currsymlen = 0
+	currsymnull = 0
+
+	readnullbyte = True
+
+
 ###
 # B. Class methods (functions)
 ###
@@ -73,6 +86,61 @@ class MyEventHandler(winappdbg.EventHandler):
 		return (t.get_pc(),h.get_params(tid))
 
 
+	def get_exportdir_names(self,module):
+		name = module.get_name()
+		baseaddr = module.get_base()
+		p = module.get_process()
+
+		lfa_new = baseaddr + p.read_uint(baseaddr + 0x3c)
+		#log("[D]    lfa_new: 0x%x" % lfa_new)
+		export_diraddr = baseaddr + p.read_uint(lfa_new + 0x78)
+		export_dirsize = p.read_uint(lfa_new + 0x78 + 0x04)
+		export_numofnames = p.read_uint(export_diraddr + 0x18)
+		export_addressofnames = baseaddr + p.read_uint(export_diraddr + 0x20)
+
+		#log("[D]    BaseAddress: 0x%x" % baseaddr)
+		#log("[D]    NumberOfNames: %d" % export_numofnames)
+		#log("[D]    AddressOfNames: 0x%x" % export_addressofnames)
+
+		for i in range(0,export_numofnames):
+			export_nameaddr = baseaddr + p.read_uint(export_addressofnames + (i * 4))
+			export_name = p.peek_string(export_nameaddr)
+			self.exportednames[export_nameaddr] = (name,export_name)
+			#log("[-]     0x%x: %s.%s" % (export_nameaddr,name,export_name))
+
+		#
+		# get addresses to set guard pages
+		#
+		firstname = baseaddr + p.read_uint(export_addressofnames)
+		endofnames = export_diraddr + export_dirsize
+		nameslen = endofnames - firstname + 1
+
+		return (firstname,nameslen)
+
+
+	#
+	# pid, start, and end are used to reference pages saved in exportdirs
+	# addr is addr of the string. we need to find the end ourselves.
+	def read_export_string(self,pid,start,end,addr):
+		pagesize = winappdbg.System.pageSize
+		if ((pid,start,end) in self.exportdirs):
+			pg1 = self.exportdirs[(pid,start,end)]
+
+			if ((pid,end,end + pagesize) in self.exportdirs):
+				pg2 = self.exportdirs[(pid,end,end + pagesize)]
+			else:
+				pg2 = ""
+			pgs = pg1 + pg2
+
+			offset = addr - start
+			nullbyte = pgs.find("\0",offset)
+			symname = pgs[offset:nullbyte]
+		else:
+			log("[E] read_export_string(): address range not found in exportdirs!")
+
+		return symname
+
+
 ###
 # C. API Hooks
 ###
@@ -87,6 +155,7 @@ class MyEventHandler(winappdbg.EventHandler):
 	apiHooks = {
 		"kernel32.dll":[
 			("VirtualAllocEx",5),
+			("IsDebuggerPresent",0)
 		],
 		"advapi32.dll":[
 			("CryptDecrypt",6)
@@ -165,6 +234,15 @@ class MyEventHandler(winappdbg.EventHandler):
 		except:
 			traceback.print_exc()
 			raise
+
+
+	def post_IsDebuggerPresent(self,event,retval):
+		(ra) = self.get_funcargs(event)
+
+		log("[*] IsDebuggerPresent(): 0x%x" % retval)
+
+		t = event.get_thread()
+		t.set_register("Eax",0x0)
 
 
 	# C.3
@@ -270,23 +348,90 @@ class MyEventHandler(winappdbg.EventHandler):
 	#
 	###
 
-	def membp_exportdir(self,exception):
-		e_addr = exception.get_exception_address()
-		f_addr = exception.get_fault_address()
-		f_type = exception.get_fault_type()
+	# Almost working. Needs debug output removing. Possibly needs tidying
+	# Fails to log last symbol searched for, as we don't get another memory access and hence
+	# no guard page to log the last symbol
+	# Consider checking if subsequent calls increment f_addr all the way to null byte (hashing), or 
+	# jump up the symbols (strcmp() behaviour)
+	# If jumping, then log if we read trailing null byte (symaddr + symlen)
+	# If keeps incrementing, then log ... hmm... need to think
+	def guard_page_exportdir(self,exception):
+		try:
+			if (self.ntbrkpthit):
+				# E.1.1 Get the exception and fault information that we need
+				e_addr = exception.get_exception_address()
+				f_addr = exception.get_fault_address()
+				f_type = exception.get_fault_type()
 
-		if (f_type == winappdbg.win32.EXCEPTION_READ_FAULT):
-			if not e_addr in self.exportdirrdaddrs:
-				p = exception.get_process()
-				e_label = p.get_label_at_address(e_addr)
+				if (f_type == winappdbg.win32.EXCEPTION_READ_FAULT):
+					p = exception.get_process()
+					e_label = p.get_label_at_address(e_addr)
+					if (not e_label.startswith("ntdll!")):
 
-				if (not e_label.startswith("ntdll!")):
-					t = exception.get_thread()
-					instr = t.disassemble_instruction(e_addr)[2].lower()
-					log("[*] Memory breakpoint (0x%x) on export directory address 0x%x referenced from 0x%x (%s)" % (f_type,f_addr,e_addr,instr))
-					self.exportdirrdaddrs[e_addr] = instr
-				else:
-					self.exportdirrdaddrs[e_addr] = "<ntdll>"
+						#
+						# Non-ntdll code searching through export directory
+						#
+
+						# if we haven't already logged this address...
+						if not e_addr in self.exportdirrdaddrs:
+							# ... then log it
+
+							t = exception.get_thread()
+							instr = t.disassemble_instruction(e_addr)[2].lower()
+							log("[*] Memory breakpoint (0x%x) on export directory address 0x%x referenced from 0x%x (%s)" % (f_type,f_addr,e_addr,instr))
+							self.exportdirrdaddrs[e_addr] = instr
+
+						#
+						# attempt to find symbol
+						#
+
+						#log("[D]   f_addr: 0x%x  currsym: 0x%x (%s)  currsymlen: %d" % (f_addr,self.currsym,self.exportednames[self.currsym],self.currsymlen))
+						if not ((f_addr >= self.currsym) and (f_addr < self.currsym + self.currsymlen + 1)):
+							#
+							# we've changed symbol
+							#
+
+							pid = p.get_pid()
+							b = exception.breakpoint
+							(start,end) = b.get_span()
+							symname = self.read_export_string(pid,start,end,f_addr)
+							symlen = len(symname)
+
+							#log("[D]   Found symbol in pg: %s (%d bytes)" % (symname,symlen))
+							#log("[D]    brkpt: 0x%x - 0x%x" % (start,end))
+
+							# is it the next symbol in the directory?
+							if (f_addr == self.currsym + self.currsymlen + 1) or (self.currsym == 0):
+								if (self.currsym > 0): self.readnullbyte = self.readnullbyte and self.currsymnull
+								self.currsymnull = False
+
+								if (f_addr in self.exportednames):
+									self.currsym = f_addr
+									(mod,name) = self.exportednames[self.currsym]
+									self.currsymlen = len(name)
+									#log("[D] Started reading symbol %s (0x%x)" % (mod + "." + name,self.currsym))
+								else:
+									log("[E] Next symbol not in exportednames{}")
+							else:
+								# no, so we've found what we were looking for
+								if (self.currsym > 0):
+									(mod,name) = self.exportednames[self.currsym]
+									log("[*]   Last symbol read was %s (0x%x)  f_addr: 0x%x  nullbyte: %d" % (mod + "." + name,self.currsym,f_addr,self.readnullbyte))
+									if (f_addr in self.exportednames):
+										self.currsym = f_addr
+										(mod,name) = self.exportednames[self.currsym]
+										self.currsymlen = len(name)
+								self.readnullbyte = True
+							self.currsymnull = False
+						elif (f_addr == self.currsym + self.currsymlen):
+							# hit the null byte
+							#log("[D]   read null byte")
+							self.currsymnull = True
+					else:
+						self.exportdirrdaddrs[e_addr] = "<ntdll>"
+		except:
+			traceback.print_exc()
+			raise
 
 
 	#def guard_page(self,exception):
@@ -307,35 +452,33 @@ class MyEventHandler(winappdbg.EventHandler):
 			p = event.get_process()
 			if (event.get_filename().endswith("ntdll.dll")):
 				m = event.get_module()
-				modsize = m.get_size()
-				self.ntdll = (baseaddr,modsize)
 
-			lfa_new = baseaddr + p.read_uint(baseaddr + 0x3c)
-			log("[D]    lfa_new: 0x%x" % lfa_new)
-			export_diraddr = baseaddr + p.read_uint(lfa_new + 0x78)
-			export_dirsize = p.read_uint(lfa_new + 0x78 + 0x04)
-			export_numofnames = p.read_uint(export_diraddr + 0x18)
-			export_addressofnames = baseaddr + p.read_uint(export_diraddr + 0x20)
+				# resolve this here so that it is resolvable in exception()
+				# below!
+				self.DbgBreakPoint = m.resolve_symbol("DbgBreakPoint")
+			#	modsize = m.get_size()
+			#	self.ntdll = (baseaddr,modsize)
 
-			log("[D]    BaseAddress: 0x%x" % baseaddr)
-			log("[D]    NumberOfNames: %d" % export_numofnames)
-			log("[D]    AddressOfNames: 0x%x" % export_addressofnames)
-
-			for i in range(0,export_numofnames - 1):
-				export_nameaddr = baseaddr + p.read_uint(export_addressofnames + (i * 4))
-				export_name = p.peek_string(export_nameaddr) + "\0"
-				log("[-]     0x%x: %s" % (export_nameaddr,export_name))
+			m = event.get_module()
+			(addr,size) = self.get_exportdir_names(m)
 
 			d = event.debug
-			pid = event.get_pid()
+			pid = p.get_pid()
 
-			firstname = baseaddr + p.read_uint(export_addressofnames)
-			endofnames = export_diraddr + export_dirsize
-			nameslen = endofnames - firstname + 1
-		
-			log("[D]    Setting breakpoint for 0x%x - 0x%x (0x%x bytes)" % (firstname,endofnames,nameslen))
-			#self.exportdirs[(firstname,nameslen)] = event.get_filename()
-			d.watch_buffer(pid,firstname,nameslen,self.membp_exportdir)
+			pagesize = winappdbg.System.pageSize
+			numpages = int(size / pagesize) + 1
+			pg_start = int(addr / pagesize) * pagesize
+
+			for pgnum in range(0,numpages):
+				start = pg_start + (pgnum * pagesize)
+				#log("[D]     reading page #%d of 0x%x bytes from 0x%x" % (pgnum,pagesize,start))
+				pg = p.read(start,pagesize)
+				self.exportdirs[(pid,start,start + pagesize)] = pg
+
+			#
+			# *** this is the slow bit!
+			#
+			d.watch_buffer(pid,addr,size,self.guard_page_exportdir)
 		except:
 			traceback.print_exc()
 			raise
@@ -363,7 +506,6 @@ class MyEventHandler(winappdbg.EventHandler):
 
 	def guard_page(self,exception):
 		try:
-			# E.1.1 Get the exception and fault information that we need
 			f_type = exception.get_fault_type()
 
 			e_addr = exception.get_exception_address()
@@ -409,7 +551,7 @@ class MyEventHandler(winappdbg.EventHandler):
 				jmpinstr = t.disassemble_instruction(self.lasteip[0])[2].lower()
 
 				# E.1.3.1 Log what we've found
-				log("[D]     lasteip[1]: 0x%x" % self.lasteip[1])
+				#log("[D]     lasteip[1]: 0x%x" % self.lasteip[1])
 				log("[*]     Found unpacked entry point at 0x%x called from 0x%x (%s)" % (self.entrypt,self.lasteip[0],jmpinstr))
 				log("[-]     Unpacking loop at 0x%x - 0x%x" % (self.lowesteip,self.highesteip))
 
@@ -496,6 +638,13 @@ class MyEventHandler(winappdbg.EventHandler):
 	def exception(self,exception):
 		log("[*] Unhandled exception at 0x%x: %s" % (exception.get_exception_address(),exception.get_exception_name()))
 
+		p = exception.get_process()
+		d = exception.debug
+
+		e_addr = exception.get_exception_address()
+		self.ntbrkpthit = (e_addr == p.resolve_symbol("DbgBreakPoint"))
+
+
 #
 #### end of MyEventHandler class
 #
@@ -532,7 +681,7 @@ def simple_debugger(filename):
 		#logfile = winappdbg.textio.Logger(filename + ".log",verbose = True)
 	except:
 		traceback.print_exc()
-	with winappdbg.Debug(handler,bKillOnExit = True) as debug:
+	with winappdbg.Debug(handler,bKillOnExit = True,bHostileCode = False) as debug:
 		log("[*] Starting %s" % filename)
 		debug.execl(filename)
 		log("[*] Starting debug loop")
@@ -544,4 +693,6 @@ def simple_debugger(filename):
 # G. Start of script execution
 ###
 
+log("[*] Started at %s" % str(datetime.datetime.now()))
 simple_debugger(sys.argv[1])
+log("[*] Completed at %s" % str(datetime.datetime.now()))
