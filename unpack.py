@@ -2,7 +2,7 @@
 # Python script to attempt automatic unpacking/decrypting of #
 # malware samples using WinAppDbg.                           #
 #                                                            #
-# unpack.py v2014.06.30                                      #
+# unpack.py v2014.08.16                                      #
 # http://malwaremusings.com/scripts/unpack.py                #
 ##############################################################
 
@@ -11,6 +11,7 @@ import traceback
 import winappdbg
 import time
 import struct
+import ctypes
 
 
 # Log file which we log info to
@@ -33,7 +34,7 @@ class MyEventHandler(winappdbg.EventHandler):
 	#
 
 	# A.3 used to indicate that we're single stepping
-	tracing = {}
+	tracing = -1
 
 	# A.4 remember the last two eip values
 	lasteip = [0x00000000,0x00000000]
@@ -51,25 +52,24 @@ class MyEventHandler(winappdbg.EventHandler):
 	#     that write to the allocated memory block(s)
 	writeaddrs = {}
 
-
 	#
-	# variables used to find export symbols
+	# variables used to keep track of created processes
 	#
 
-	ntbrkpthit = False
-	exportednames = {0x00000000:"invalid"}
-	exportdirrdaddrs = {}
-	#exportdirs = {}
-	#currsym = 0
-	#currsymlen = 0
-	#currsymnull = 0
-
-	#readnullbyte = True
-
-	membps = {}
-
+	# A.9 keeps track of created processes to map
+	#     hProcess from WriteProcessMemory() back to
+	#     process name
 	createdprocesses = {}
 
+	# A.10 keeps track of processes that were created
+	#      with the CREATE_SUSPENDED flag set
+	createsuspended = {}
+
+	#
+	# variables used for logging
+	#
+
+	# A.11 used to keep a log of events
 	eventlog = []
 
 
@@ -93,89 +93,50 @@ class MyEventHandler(winappdbg.EventHandler):
 		return (t.get_pc(),h.get_params(tid))
 
 
-	def get_exportdir_names(self,module):
-		name = module.get_name()
-		baseaddr = module.get_base()
-		p = module.get_process()
-
-		lfa_new = baseaddr + p.read_uint(baseaddr + 0x3c)
-		#log("[D]    lfa_new: 0x%x" % lfa_new)
-		export_diraddr = baseaddr + p.read_uint(lfa_new + 0x78)
-		export_dirsize = p.read_uint(lfa_new + 0x78 + 0x04)
-		export_numofnames = p.read_uint(export_diraddr + 0x18)
-		export_addressofnames = baseaddr + p.read_uint(export_diraddr + 0x20)
-
-		#log("[D]    BaseAddress: 0x%x" % baseaddr)
-		#log("[D]    NumberOfNames: %d" % export_numofnames)
-		#log("[D]    AddressOfNames: 0x%x" % export_addressofnames)
-
-		for i in range(0,export_numofnames):
-			export_nameaddr = baseaddr + p.read_uint(export_addressofnames + (i * 4))
-			export_name = p.peek_string(export_nameaddr)
-			self.exportednames[export_nameaddr] = (name,export_name)
-			#log("[-]     0x%x: %s.%s" % (export_nameaddr,name,export_name))
-
-		#
-		# get addresses to set guard pages
-		#
-		firstname = baseaddr + p.read_uint(export_addressofnames)
-		endofnames = export_diraddr + export_dirsize
-		nameslen = endofnames - firstname + 1
-
-		return (firstname,nameslen)
-
-
+	### B.2
+	# guarded_read(d,t,addr,size)
+	#     read memory after checking for, and if necessary,
+	#     disabling memory breakpoints
 	#
-	# pid, start, and end are used to reference pages saved in exportdirs
-	# addr is addr of the string. we need to find the end ourselves.
-	def read_export_string(self,pid,start,end,addr):
-		pagesize = winappdbg.System.pageSize
-		if ((pid,start,end) in self.exportdirs):
-			pg1 = self.exportdirs[(pid,start,end)]
+	#     returns a string of data
+	###
 
-			if ((pid,end,end + pagesize) in self.exportdirs):
-				pg2 = self.exportdirs[(pid,end,end + pagesize)]
-			else:
-				pg2 = ""
-			pgs = pg1 + pg2
-
-			offset = addr - start
-			nullbyte = pgs.find("\0",offset)
-			symname = pgs[offset:nullbyte]
-		else:
-			log("[E] read_export_string(): address range not found in exportdirs!")
-
-		return symname
-
-
-	#
-	# For what we are about to read
-	# May the Lord make sure 
-	# There're no breakpoints
-	# Amen
-	#
 	def guarded_read(self,d,t,addr,size):
+		# keep track of breakpoints that we disabled
+		# so that we can enable them again after we've
+		# finished
 		reenablebps = []
 
+		# initialise the variable to hold the read 
+		# memory data
 		data = ""
+
+		# check that the requested size is sane
 		if (size > 0):
 			p = t.get_process()
 
+			# check to see if the requested address falls within
+			# any of the existing memory breakpoints by checking
+			# if either the requested start address or end address
+			# is covered by any breakpoint
 			mem_bps = d.get_all_page_breakpoints()
 			for (pid,pgbp) in mem_bps:
-				pgbpspan = pgbp.get_span()
+				(startaddr,endaddr) = pgbp.get_span()
 				if (pid == p.get_pid()) and (pgbp.is_here(addr) or pgbp.is_here(addr + size - 1)):
 					log("[D]   Memory read in guarded memory. Disabling breakpoint: %s" % pgbp)
 					pgbp.disable(p,t)
 					reenablebps.append(pgbp)
 
+			# read the memory
 			data = p.read(addr,size)
 
+			# enable all of the breakpoints that we disabled
 			if (len(reenablebps) > 0):
 				for pgbp in reenablebps:
 					log("[D]   Re-enabling breakpoint: %s" % pgbp)
 					pgbp.enable(p,t)
 
+		# return the read memory as a string
 		return data
 
 
@@ -192,6 +153,7 @@ class MyEventHandler(winappdbg.EventHandler):
 
 	apiHooks = {
 		"kernel32.dll":[
+			("VirtualAlloc",4),
 			("VirtualAllocEx",5),
 			("IsDebuggerPresent",0),
 			("CreateProcessA",10),
@@ -221,7 +183,7 @@ class MyEventHandler(winappdbg.EventHandler):
 	###
 
 	# C.2
-	# VirtualAllocEx() hook(s)
+	# VirtualAlloc() hook(s)
 	#
 
 	def post_VirtualAllocEx(self,event,retval):
@@ -248,7 +210,7 @@ class MyEventHandler(winappdbg.EventHandler):
 			# non-zero result
 
 			if (flProtect & 0x0f0):
-				log("[*]     Request for EXECUTEable memory")
+				log("[-]   Request for EXECUTEable memory")
 
 				# We can only set page guards on our own process
 				# otherwise page guard exception will occur in 
@@ -294,13 +256,47 @@ class MyEventHandler(winappdbg.EventHandler):
 			raise
 
 
-	def post_IsDebuggerPresent(self,event,retval):
-		(ra) = self.get_funcargs(event)
+	def post_VirtualAlloc(self,event,retval):
+	#def pre_VirtualAlloc(self,event,*args):
+		try:
+			# C.2.1 Get the return address and arguments
 
-		log("[*] IsDebuggerPresent(): 0x%x" % retval)
+			#(ra,lpAddress,dwSize,flAllocationType,flProtect) = (args[0],args[1],args[2],args[3],args[4])
+			(ra,(lpAddress,dwSize,flAllocationType,flProtect)) = self.get_funcargs(event)
 
-		t = event.get_thread()
-		t.set_register("Eax",0x0)
+			# Get an instance to the debugger which triggered the event
+			# and also the process id and thread id of the process to which 
+			# the event pertains
+
+			d = event.debug
+			pid = event.get_pid()
+			tid = event.get_tid()
+
+			# Log the fact that we've seen a VirtualAlloc() call
+			# This is so that we get the address in the debuggee code from which it was called
+			# where as if we just let the VirtualAllocEx() hook log it, the address from 
+			# which it was called is inside the VirtualAlloc() code in kernel32.dll
+
+			log("[*] <%d:%d> 0x%x: VirtualAlloc(0x%x,0x%x (%d),0x%x,0x%03x) = 0x%x" % (pid,tid,ra,lpAddress,dwSize,dwSize,flAllocationType,flProtect,retval))
+
+			self.eventlog.append({
+				"time": time.time(),
+				"name": "VirtualAlloc",
+				"type": "Win32 API",
+				"pid": pid,
+				"tid": tid,
+				"addr": ra,
+				"args": {
+					"lpAddress": lpAddress,
+					"dwSize": dwSize,
+					"flAllocationType": flAllocationType,
+					"flProtect": flProtect
+				},
+				"ret": retval
+			})
+		except:
+			traceback.print_exc()
+			raise
 
 
 	# C.3
@@ -308,7 +304,7 @@ class MyEventHandler(winappdbg.EventHandler):
 	#
 
 	def pre_CryptDecrypt(self,event,*args):
-		(ra,(hKey,hHash,Final,dwFlags,pbData,pdwDataLen)) = self.get_funcargs(event)
+		(ra,hKey,hHash,Final,dwFlags,pbData,pdwDataLen) = (args[0],args[1],args[2],args[3],args[4],args[5],args[6])
 
 		p = event.get_process()
 		buffsize = p.read_uint(pdwDataLen)
@@ -317,7 +313,7 @@ class MyEventHandler(winappdbg.EventHandler):
 		# save a copy of the encrypted data
 		#
 		filename = "%s.memblk0x%x.enc" % (sys.argv[1],pbData)
-		log("[-]    Dumping %d bytes of encrypted memory at 0x%x to %s" % (buffsize,pbData,filename))
+		log("[-]   Dumping %d bytes of encrypted memory at 0x%x to %s" % (buffsize,pbData,filename))
 		databuff = open(filename,"wb")
 		databuff.write(p.read(pbData,buffsize));
 		databuff.close()
@@ -329,12 +325,17 @@ class MyEventHandler(winappdbg.EventHandler):
 		p = event.get_process()
 		buffsize = p.read_uint(pdwDataLen)
 
+		pid = event.get_pid()
+		tid = event.get_tid()
+
+		log("[*] <%d:%d> 0x%x: CryptDecrypt(0x%x,0x%x,0x%x,0x%x,0x%x,0x%x (%d)) = %d" % (pid,tid,ra,hKey,hHash,Final,dwFlags,pbData,buffsize,buffsize,retval))
+
 		#
 		# save a copy of the decrypted data
 		#
 		filename_enc = "%s.memblk0x%x.enc" % (sys.argv[1],pbData)
 		filename = "%s.memblk0x%x.dec" % (sys.argv[1],pbData)
-		log("[-]    Dumping %d bytes of decrypted memory at 0x%x to %s" % (buffsize,pbData,filename))
+		log("[-]   Dumping %d bytes of decrypted memory at 0x%x to %s" % (buffsize,pbData,filename))
 		databuff = open(filename,"wb")
 		databuff.write(p.read(pbData,buffsize))
 		databuff.close()
@@ -364,27 +365,79 @@ class MyEventHandler(winappdbg.EventHandler):
 
 
 	# C.4
-	# InternetOpen*() hook(s)
+	# RtlDecompressBuffer() hook(s)
 	#
 
-	def post_InternetOpen(self,event,retval,fUnicode):
-		(ra,(lpszAgent,dwAccessType,lpszProxyName,lpszProxyBypass,dwFlags)) = self.get_funcargs(event)
+	def pre_RtlDecompressBuffer(self,event,*args):
+		try:
+			(ra,CompressionFormat,UncompressedBuffer,UncompressedBufferSize,CompressedBuffer,CompressedBufferSize,FinalUncompressedSize) = (args[0],args[1],args[2],args[3],args[4],args[5],args[6])
 
-		p = event.get_process()
-		szAgent = p.peek_string(lpszAgent,fUnicode) + "\0"
-		szProxyName = p.peek_string(lpszProxyName,fUnicode) + "\0"
-		szProxyBypass = p.peek_string(lpszProxyBypass,fUnicode) + "\0"
+			p = event.get_process()
 
-		log("[*] <%d:%d> 0x%x: InternetOpen(\"%s\",0x%x,\"%s\",\"%s\",0x%x) = 0x%x" % (pid,tid,ra,szAgent,dwAccessType,szProxyName,szProxyBypass,dwFlags,retval))
+			#
+			# save a copy of the compressed data
+			#
+			filename = "%s.memblk0x%x.comp" % (sys.argv[1],CompressedBuffer)
+			log("[-]   Dumping %d bytes of compressed memory at 0x%x to %s" % (CompressedBufferSize,CompressedBuffer,filename))
+			databuff = open(filename,"wb")
+			databuff.write(p.read(CompressedBuffer,CompressedBufferSize));
+			databuff.close()
+		except:
+			traceback.print_exc()
+			raise
+			
+
+	def post_RtlDecompressBuffer(self,event,retval):
+		try:
+			(ra,(CompressionFormat,UncompressedBuffer,UncompressedBufferSize,CompressedBuffer,CompressedBufferSize,FinalUncompressedSize)) = self.get_funcargs(event)
+
+			pid = event.get_pid()
+			tid = event.get_tid()
+
+			log("[*] <%d:%d> 0x%x: RtlDecompressBuffer(0x%x,0x%x,0x%x,0x%x,0x%x,0x%x): %d" % (pid,tid,ra,CompressionFormat,UncompressedBuffer,UncompressedBufferSize,CompressedBuffer,CompressedBufferSize,FinalUncompressedSize,retval))
+
+			p = event.get_process()
+			buffsize = p.read_uint(FinalUncompressedSize)
+
+			#
+			# save a copy of the decompressed data
+			#
+			filename_comp = "%s.memblk0x%x.comp" % (sys.argv[1],CompressedBuffer)
+			filename = "%s.memblk0x%x.decomp" % (sys.argv[1],UncompressedBuffer)
+			log("[-]   Dumping %d bytes of decompressed memory at 0x%x to %s" % (buffsize,UncompressedBuffer,filename))
+			databuff = open(filename,"wb")
+			databuff.write(p.read(UncompressedBuffer,buffsize))
+			databuff.close()
+
+			self.eventlog.append({
+				"time": time.time(),
+				"name": "RtlDecompressBuffer",
+				"type": "Win32 API",
+				"pid": pid,
+				"tid": tid,
+				"addr": ra,
+				"args": {
+					"CompressionFormat": CompressionFormat,
+					"UncompressedBuffer": UncompressedBuffer,
+					"UncompressedBufferSize": UncompressedBufferSize,
+					"CompressedBuffer": CompressedBuffer,
+					"CompressedBufferSize": CompressedBufferSize,
+					"FinalUncompressedSize": FinalUncompressedSize
+				},
+				"ret": retval,
+				"info": {
+					"filename_comp": filename_comp,
+					"filename_decomp": filename
+				}
+			})
+		except:
+			traceback.print_exc()
+			raise
 
 
-	def post_InternetOpenA(self,event,retval):
-		self.post_InternetOpen(event,retval,False)
-
-
-	def post_InternetOpenW(self,event,retval):
-		self.post_InternetOpen(event,retval,True)
-
+	# C.5
+	# CreateProcess() hook(s)
+	#
 
 	def post_CreateProcess(self,event,retval,fUnicode):
 		try:
@@ -399,7 +452,6 @@ class MyEventHandler(winappdbg.EventHandler):
 			szApplicationName = p.peek_string(lpApplicationName,fUnicode)
 			szCommandLine = p.peek_string(lpCommandLine,fUnicode)
 
-			log("[D]   lpProcessInformation = 0x%x" % lpProcessInformation)
 			if (lpProcessInformation):
 				d = event.debug
 				ProcessInformation = self.guarded_read(d,t,lpProcessInformation,16)
@@ -418,8 +470,9 @@ class MyEventHandler(winappdbg.EventHandler):
 				# CREATE_SUSPENDED
 				#
 				d = event.debug
-				stat = d.break_at(pid,"ResumeThread",self.bp_createprocessresume)
-				log("[-]   CREATE_SUSPENDED. Setting breakpoint at ResumeThread() (%d)" % stat)
+				stat = d.hook_function(pid,"ResumeThread",preCB = self.hook_createsuspendedresume,paramCount = 1)
+				self.createsuspended[(pid,hThread)] = dwProcessId
+				log("[-]   CREATE_SUSPENDED. Hooking ResumeThread() (%d)" % stat)
 
 			self.createdprocesses[hProcess] = {
 				"time": time.time(),
@@ -451,11 +504,11 @@ class MyEventHandler(winappdbg.EventHandler):
 					"ProcessId": dwProcessId,
 					"ThreadId": dwThreadId
 				},
+				"info": {
+					"fUnicode":fUnicode
+				},
 				"ret": retval
 			})
-
-			#d = event.debug
-			#d.attach(dwProcessId)
 		except:
 			traceback.print_exc()
 			raise
@@ -464,15 +517,36 @@ class MyEventHandler(winappdbg.EventHandler):
 	def post_CreateProcessA(self,event,retval):
 		self.post_CreateProcess(event,retval,False)
 
+
 	def post_CreateProcessW(self,event,retval):
 		self.post_CreateProcess(event,retval,True)
 
+
+	def hook_createsuspendedresume(self,event,*args):
+		(ra,(hThread,)) = self.get_funcargs(event)
+
+		pid = event.get_pid()
+		tid = event.get_tid()
+
+		log("[*] <%d:%d> 0x%x: ResumeThread(0x%x)" % (pid,tid,ra,hThread))
+
+		if ((pid,hThread) in self.createsuspended):
+			pidresumed = self.createsuspended[(pid,hThread)]
+			log("[-]   New suspended process (pid %d) resumed" % pidresumed)
+
+
+	# C.5
+	# WriteProcessMemory() hook(s)
+	#
 
 	def post_WriteProcessMemory(self,event,retval):
 		try:
 			(ra,(hProcess,lpBaseAddress,lpBuffer,nSize,lpNumberOfBytesWritten)) = self.get_funcargs(event)
 
-			log("[*] WriteProcessMemory(0x%x,0x%x,0x%x,0x%x,0x%x): %d" % (hProcess,lpBaseAddress,lpBuffer,nSize,lpNumberOfBytesWritten,retval))
+			pid = event.get_pid()
+			tid = event.get_tid()
+
+			log("[*] <%d:%d> 0x%x: WriteProcessMemory(0x%x,0x%x,0x%x,0x%x,0x%x): %d" % (pid,tid,ra,hProcess,lpBaseAddress,lpBuffer,nSize,lpNumberOfBytesWritten,retval))
 
 			d = event.debug
 			t = event.get_thread()
@@ -497,7 +571,7 @@ class MyEventHandler(winappdbg.EventHandler):
 			pid = event.get_pid()
 			tid = event.get_tid()
 			filename = "%s.memblk0x%x-%d.wpm" % (sys.argv[1],lpBaseAddress,ProcessId)
-			log("[-]    Dumping %d bytes of memory at %d:0x%x written to %d:0x%x to %s" % (nSize,pid,lpBuffer,ProcessId,lpBaseAddress,filename))
+			log("[-]   Dumping %d bytes of memory at %d:0x%x written to %d:0x%x to %s" % (nSize,pid,lpBuffer,ProcessId,lpBaseAddress,filename))
 			databuff = open(filename,"wb")
 			databuff.write(self.guarded_read(d,t,lpBuffer,nSize))
 			databuff.close()
@@ -530,6 +604,58 @@ class MyEventHandler(winappdbg.EventHandler):
 			raise
 
 
+	# C.6
+	# IsDebuggerPresent() hook(s)
+	#
+
+	def post_IsDebuggerPresent(self,event,retval):
+		(ra,noargs) = self.get_funcargs(event)
+
+		pid = event.get_pid()
+		tid = event.get_tid()
+
+		log("[*] <%d:%d> 0x%x: IsDebuggerPresent(): 0x%x" % (pid,tid,ra,retval))
+		log("[-]   Returning 0")
+
+		self.eventlog.append({
+			"time": time.time(),
+			"name": "IsDebuggerPresent",
+			"type": "Win32 API",
+			"pid": pid,
+			"tid": tid,
+			"addr": ra,
+			"args": {},
+			"ret": retval,
+			"info": {}
+		})
+
+		t = event.get_thread()
+		t.set_register("Eax",0x0)
+
+
+	# C.7
+	# InternetOpen() hook(s)
+	#
+
+	def post_InternetOpen(self,event,retval,fUnicode):
+		(ra,(lpszAgent,dwAccessType,lpszProxyName,lpszProxyBypass,dwFlags)) = self.get_funcargs(event)
+
+		p = event.get_process()
+		szAgent = p.peek_string(lpszAgent,fUnicode) + "\0"
+		szProxyName = p.peek_string(lpszProxyName,fUnicode) + "\0"
+		szProxyBypass = p.peek_string(lpszProxyBypass,fUnicode) + "\0"
+
+		log("[*] <%d:%d> 0x%x: InternetOpen(\"%s\",0x%x,\"%s\",\"%s\",0x%x) = 0x%x" % (pid,tid,ra,szAgent,dwAccessType,szProxyName,szProxyBypass,dwFlags,retval))
+
+
+	def post_InternetOpenA(self,event,retval):
+		self.post_InternetOpen(event,retval,False)
+
+
+	def post_InternetOpenW(self,event,retval):
+		self.post_InternetOpen(event,retval,True)
+
+
 ###
 # D. winappdbg debug event handlers
 ###
@@ -543,8 +669,24 @@ class MyEventHandler(winappdbg.EventHandler):
 	def create_process(self,event):
 		try:
 			proc = event.get_process()
+
+			pid = event.get_pid()
+			tid = event.get_tid()
 		
 			log("[*] Create process event for pid %d (%s)" % (proc.get_pid(),proc.get_image_name()))
+			log("[D]   Create process event for pid %d (%d)" % (pid,tid))
+
+			self.eventlog.append({
+				"time": time.time(),
+				"name": event.get_event_name(),
+				"type": "WinAppDbg Event",
+				"pid": pid,
+				"tid": tid,
+				"info": {
+					"module_base": event.get_module_base(),
+					"filename": event.get_filename(),
+				},
+			})
 		except:
 			traceback.print_exc()
 			raise
@@ -559,6 +701,21 @@ class MyEventHandler(winappdbg.EventHandler):
 	def exit_process(self,event):
 		log("[*] Exit process event for pid %d (%s): %d" % (event.get_pid(),event.get_filename(),event.get_exit_code()))
 
+		pid = event.get_pid()
+		tid = event.get_tid()
+		
+		self.eventlog.append({
+			"time": time.time(),
+			"name": event.get_event_name(),
+			"type": "WinAppDbg Event",
+			"pid": pid,
+			"tid": tid,
+			"info": {
+				"module_base": event.get_module_base(),
+				"filename": event.get_filename(),
+			},
+		})
+
 
 	### D.3
 	# create_thread
@@ -569,60 +726,20 @@ class MyEventHandler(winappdbg.EventHandler):
 	def create_thread(self,event):
 		log("[*] Create thread event")
 
-
-	### D.x
-	# membp_exportdir
-	#
-	###
-
-	# Almost working. Needs debug output removing. Possibly needs tidying
-	# Fails to log last symbol searched for, as we don't get another memory access and hence
-	# no guard page to log the last symbol
-	# Consider checking if subsequent calls increment f_addr all the way to null byte (hashing), or 
-	# jump up the symbols (strcmp() behaviour)
-	# If jumping, then log if we read trailing null byte (symaddr + symlen)
-	# If keeps incrementing, then log ... hmm... need to think
-	def guard_page_exportdir(self,exception):
-		try:
-			if (self.ntbrkpthit):
-				# E.1.1 Get the exception and fault information that we need
-				e_addr = exception.get_exception_address()
-				f_addr = exception.get_fault_address()
-				f_type = exception.get_fault_type()
-
-				if (f_type == winappdbg.win32.EXCEPTION_READ_FAULT):
-					p = exception.get_process()
-					e_label = p.get_label_at_address(e_addr)
-					if (not e_label.startswith("ntdll!")):
-
-						#
-						# Non-ntdll code searching through export directory
-						#
-
-						# log it
-
-						t = exception.get_thread()
-						instr = t.disassemble_instruction(e_addr)[2].lower()
-						l = p.get_label_at_address(e_addr)
-						log("[*] Memory breakpoint (0x%x) on export directory address 0x%x referenced from 0x%x (%s): %s" % (f_type,f_addr,e_addr,l,instr))
-						self.exportdirrdaddrs[e_addr] = instr
-
-						# remove memory breakpoints
-
-						d = exception.debug
-						#mem_bps = d.get_all_page_breakpoints()
-
-						for (pid,addr) in self.membps:
-							size = self.membps[(pid,addr)]
-							d.dont_watch_buffer(pid,addr,size);
-
-						#
-						# attempt to find symbol
-						# (really slows things down, so removed)
-						#
-		except:
-			traceback.print_exc()
-			raise
+		pid = event.get_pid()
+		tid = event.get_tid()
+		
+		self.eventlog.append({
+			"time": time.time(),
+			"name": event.get_event_name(),
+			"type": "WinAppDbg Event",
+			"pid": pid,
+			"tid": tid,
+			"info": {
+				"module_base": event.get_module_base(),
+				"filename": event.get_filename(),
+			},
+		})
 
 
 	### D.4
@@ -635,40 +752,8 @@ class MyEventHandler(winappdbg.EventHandler):
 		try:
 			log("[*] Load DLL: %s" % event.get_filename())
 
-			baseaddr = event.get_module_base()
-			p = event.get_process()
-			self.DbgBreakPoint = p.get_system_breakpoint()
-
-			#if (event.get_filename().endswith("ntdll.dll")):
-			#	m = event.get_module()
-
-			#	# resolve this here so that it is resolvable in exception()
-			#	# below!
-			#	self.DbgBreakPoint = m.resolve_symbol("DbgBreakPoint")
-			#	log("[D]  DbgBreakPoint = 0x%x   system breakpoint = 0x%x" % (self.DbgBreakPoint,p.get_system_breakpoint()))
-
-			m = event.get_module()
-			(addr,size) = self.get_exportdir_names(m)
-
-			d = event.debug
 			pid = event.get_pid()
 			tid = event.get_tid()
-
-			#
-			# Need to uncomment this block if wanting to find symbol
-			#
-			#pagesize = winappdbg.System.pageSize
-			#numpages = int(size / pagesize) + 1
-			#pg_start = int(addr / pagesize) * pagesize
-			#
-			#for pgnum in range(0,numpages):
-			#	start = pg_start + (pgnum * pagesize)
-			#	#log("[D]     reading page #%d of 0x%x bytes from 0x%x" % (pgnum,pagesize,start))
-			#	pg = p.read(start,pagesize)
-			#	self.exportdirs[(pid,start,start + pagesize)] = pg
-
-			#d.watch_buffer(pid,addr,size,self.guard_page_exportdir)
-			#self.membps[(pid,addr)] = size
 
 			self.eventlog.append({
 				"time": time.time(),
@@ -742,12 +827,11 @@ class MyEventHandler(winappdbg.EventHandler):
 				#         stepping. If not, enable it, and make a note
 				#         of the fact by setting the tracing variable
 				#         to True
-				tid = exception.get_tid()
-				if (tid not in self.tracing):
-					#d = exception.debug
-					#self.tracing[tid] = 0
-					#d.start_tracing(tid)
-					pass
+				if (self.tracing == -1):
+					self.tracing = 0
+					d = exception.debug
+					log("[-]   Enabling tracing")
+					d.start_tracing(exception.get_tid())
 
 			# E.1.3 Was it a memory instruction fetch (execute) operation, 
 			#       and if so, are we still looking for the entry point address?
@@ -758,8 +842,8 @@ class MyEventHandler(winappdbg.EventHandler):
 
 				# E.1.3.1 Log what we've found
 				#log("[D]     lasteip[1]: 0x%x" % self.lasteip[1])
-				log("[*]     Found unpacked entry point at 0x%x called from 0x%x (%s)" % (self.entrypt,self.lasteip[0],jmpinstr))
-				log("[-]     Unpacking loop at 0x%x - 0x%x" % (self.lowesteip,self.highesteip))
+				log("[*]   Found unpacked entry point at 0x%x called from 0x%x (%s) (after executing %d instructions)" % (self.entrypt,self.lasteip[0],jmpinstr,self.tracing))
+				log("[-]   Unpacking loop at 0x%x - 0x%x" % (self.lowesteip,self.highesteip))
 
 				pid = exception.get_pid()
 				tid = exception.get_tid()
@@ -784,15 +868,13 @@ class MyEventHandler(winappdbg.EventHandler):
 						endaddr = memblk + size - 1
 						if (e_addr >= memblk) and (e_addr <= endaddr):
 							# E.1.3.3 Log what we're doing and delete the memory breakpoint
-							log("[-]     Dumping %d bytes of memory range 0x%x - 0x%x" % (size,memblk,endaddr))
+							log("[-]   Dumping %d bytes of memory range 0x%x - 0x%x" % (size,memblk,endaddr))
 							d = exception.debug
 							d.dont_watch_buffer(exception.get_pid(),memblk,size - 1)
 
 							# E.1.3.4 Disable single-step debugging
-							tid = exception.get_tid()
-							if not (tid in self.tracing):
-								del(self.tracing[tid])
-								d.stop_tracing(tid)
+							self.tracing = -1
+							d.stop_tracing(exception.get_tid())
 
 							# E.1.3.5 Reset unpacking loop variables
 							self.entrypt = 0x00000000
@@ -851,20 +933,26 @@ class MyEventHandler(winappdbg.EventHandler):
 			self.lasteip[0] = self.lasteip[1]
 			self.lasteip[1] = e_addr
 
-			tid = exception.get_tid()
-			if (self.tracing[tid] == 10000):
-				log("[E] Reached tracing limit of 10000 instructions")
+			self.tracing += 1
+			if (self.tracing >= 250000):
+				log("[E] Reached tracing limit of 250000 instructions")
+
 				d = exception.debug
-				d.stop_tracing(tid)
-				self.tracing[tid] = None
+				pid = exception.get_pid()
+				d.break_at(pid,e_addr,self.bp_stoptracing)
+
+				self.tracing = -1
 		except Exception as e:
 			traceback.print_exc()
 			raise
 
-
-	def bp_createprocessresume(self,exception):
-		log("[*] Created suspended process resumed")
-
+	def bp_stoptracing(self,exception):
+		log("[D] Single-step instruction limit reached -- stopping tracing")
+		d = exception.debug
+		tid = exception.get_tid()
+		pid = exception.get_pid()
+		d.stop_tracing(tid)
+		d.dont_break_at(pid,exception.get_exception_address())
 
 	### E.3
 	# exception
@@ -875,12 +963,6 @@ class MyEventHandler(winappdbg.EventHandler):
 	def exception(self,exception):
 		log("[*] Unhandled exception at 0x%x: %s" % (exception.get_exception_address(),exception.get_exception_name()))
 		#log("[-]   0x%x fault at 0x%x" % (exception.get_fault_type(),exception.get_fault_address()))
-
-		p = exception.get_process()
-		d = exception.debug
-
-		e_addr = exception.get_exception_address()
-		self.ntbrkpthit = (e_addr == p.resolve_symbol("DbgBreakPoint"))
 
 
 #
