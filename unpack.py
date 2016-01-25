@@ -169,6 +169,10 @@ class MyEventHandler(winappdbg.EventHandler):
     ],
     "ntdll.dll":[
       ("RtlDecompressBuffer",6)
+    ],
+    "secur32.dll":[
+      ("EncryptMessage",4),
+      ("DecryptMessage",4)
     ]
   }
 
@@ -744,6 +748,100 @@ class MyEventHandler(winappdbg.EventHandler):
 
   def post_InternetOpenW(self,event,retval):
     self.post_InternetOpen(event,retval,True)
+
+
+  def pre_EncryptMessage(self,event,*args):
+    # C.?.1 Get the return address and arguments
+
+    try:
+      (ra,phContext,fQOP,pMessage,MessageSeqNo) = (args[0],args[1],args[2],args[3],args[4])
+
+      pid = event.get_pid()
+      tid = event.get_tid()
+
+      # Right -- this is going to get annoying
+      # pMessage is a pointer to a SecBufferDesc structure
+      # which describes an array of SecBuffer structures
+      p = event.get_process()
+      l = p.get_label_at_address(ra)
+
+      # really ought to use a ctypes struct for this!
+      ulVersion = p.peek_uint(pMessage)
+      cBuffers = p.peek_uint(pMessage + 4)
+      pBuffers = p.peek_uint(pMessage + 8)
+
+      log("[*] <%d:%d> %s 0x%x: EncryptMessage(...)" % (pid,tid,l,ra))
+      log("[D]   ulVersion: %d" % ulVersion)
+      log("[D]   cBuffers:  %d" % cBuffers)
+      log("[D]   pBuffers:  0x%x" % pBuffers)
+
+      # dump buffer list
+      for i in range(0,cBuffers):
+        cbBuffer = p.peek_uint(pBuffers + (i * 12) + 0)
+        BufferType = p.peek_uint(pBuffers + (i * 12) + 4)
+        pvBuffer = p.peek_uint(pBuffers + (i * 12) + 8)
+
+        if (BufferType == 1):	# SECBUFFER_DATA
+          # we have data to save
+          filename = sys.argv[1] + ".encmsg0x%08x-%d" % (pvBuffer,pid)
+
+          f = open(filename,"ab")
+          f.write(p.peek(pvBuffer,cbBuffer))
+          f.close()
+
+        log("[D]")
+        log("[D]   cbBuffer: 0x%x (%d)" % (cbBuffer,cbBuffer))
+        log("[D]   BufferType: 0x%x" % BufferType)
+        log("[D]   pvBuffer: 0x%x" % pvBuffer)
+    except:
+      traceback.print_exc()
+      raise
+
+
+  def post_DecryptMessage(self,event,retval):
+    # C.?.1 Get the return address and arguments
+
+    try:
+      (ra,(phContext,pMessage,MessageSeqNo,pfQOP)) = self.get_funcargs(event)
+
+      pid = event.get_pid()
+      tid = event.get_tid()
+
+      # Right -- this is going to get annoying
+      # pMessage is a pointer to a SecBufferDesc structure
+      # which describes an array of SecBuffer structures
+      p = event.get_process()
+
+      # really ought to use a ctypes struct for this!
+      ulVersion = p.peek_uint(pMessage)
+      cBuffers = p.peek_uint(pMessage + 4)
+      pBuffers = p.peek_uint(pMessage + 8)
+
+      log("[*] <%d:%d> 0x%x: DecryptMessage(...)" % (pid,tid,ra))
+      log("[D]   ulVersion: %d" % ulVersion)
+      log("[D]   cBuffers:  %d" % cBuffers)
+      log("[D]   pBuffers:  0x%x" % pBuffers)
+
+      # dump buffer list
+      for i in range(0,cBuffers):
+        cbBuffer = p.peek_uint(pBuffers + (i * 12) + 0)
+        BufferType = p.peek_uint(pBuffers + (i * 12) + 4)
+        pvBuffer = p.peek_uint(pBuffers + (i * 12) + 8)
+
+        if (BufferType == 1):	# SECBUFFER_DATA
+          # we have data to save
+          filename = sys.argv[1] + ".decmsg0x%08x-%d" % (pvBuffer,pid)
+          f = open(filename,"ab")
+          f.write(p.peek(pvBuffer,cbBuffer))
+          f.close()
+
+        log("[D]")
+        log("[D]   cbBuffer: 0x%x (%d)" % (cbBuffer,cbBuffer))
+        log("[D]   BufferType: 0x%x" % BufferType)
+        log("[D]   pvBuffer: 0x%x" % pvBuffer)
+    except:
+      traceback.print_exc()
+      raise
 
 
 ###
