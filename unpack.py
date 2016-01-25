@@ -2,7 +2,7 @@
 # Python script to attempt automatic unpacking/decrypting of #
 # malware samples using WinAppDbg.                           #
 #                                                            #
-# unpack.py v2014.09.16                                      #
+# unpack.py v2016.01.25                                      #
 # http://malwaremusings.com/scripts/unpack.py                #
 ##############################################################
 
