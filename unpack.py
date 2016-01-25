@@ -718,12 +718,15 @@ class MyEventHandler(winappdbg.EventHandler):
 
     (ra,(lpszAgent,dwAccessType,lpszProxyName,lpszProxyBypass,dwFlags)) = self.get_funcargs(event)
 
+    pid = event.get_pid()
+    tid = event.get_tid()
+
     # C.8.2 Dereference arguments
 
     p = event.get_process()
-    szAgent = p.peek_string(lpszAgent,fUnicode) + "\0"
-    szProxyName = p.peek_string(lpszProxyName,fUnicode) + "\0"
-    szProxyBypass = p.peek_string(lpszProxyBypass,fUnicode) + "\0"
+    szAgent = p.peek_string(lpszAgent,fUnicode)
+    szProxyName = p.peek_string(lpszProxyName,fUnicode)
+    szProxyBypass = p.peek_string(lpszProxyBypass,fUnicode)
 
     log("[*] <%d:%d> 0x%x: InternetOpen(\"%s\",0x%x,\"%s\",\"%s\",0x%x) = 0x%x" % (pid,tid,ra,szAgent,dwAccessType,szProxyName,szProxyBypass,dwFlags,retval))
 
@@ -855,29 +858,28 @@ class MyEventHandler(winappdbg.EventHandler):
   ###
 
   def create_process(self,event):
-    try:
-      proc = event.get_process()
+    p = event.get_process()
 
-      pid = event.get_pid()
-      tid = event.get_tid()
+    pid = event.get_pid()
+    tid = event.get_tid()
     
-      log("[*] Create process event for pid %d (%s)" % (proc.get_pid(),proc.get_image_name()))
-      log("[D]   Create process event for pid %d (%d)" % (pid,tid))
+    log("[*] <%d:%d> Create process event for pid %d (%s)" % (pid,tid,p.get_pid(),p.get_image_name()))
+    log("[-]   %s" % p.get_command_line())
+    #log("[D]   Create process event for pid %d (%d)" % (pid,tid))
 
-      self.eventlog.append({
-        "time": time.time(),
-        "name": event.get_event_name(),
-        "type": "WinAppDbg Event",
-        "pid": pid,
-        "tid": tid,
-        "info": {
-          "module_base": event.get_module_base(),
-          "filename": event.get_filename(),
-        },
-      })
-    except:
-      traceback.print_exc()
-      raise
+    self.eventlog.append({
+      "time": time.time(),
+      "name": event.get_event_name(),
+      "type": "WinAppDbg Event",
+      "pid": pid,
+      "tid": tid,
+      "info": {
+        "pid": p.get_pid(),
+        "module_base": event.get_module_base(),
+        "filename": event.get_filename(),
+        "cmdline": p.get_command_line()
+      },
+    })
 
 
   ### D.2
@@ -887,11 +889,11 @@ class MyEventHandler(winappdbg.EventHandler):
   ###
 
   def exit_process(self,event):
-    log("[*] Exit process event for pid %d (%s): %d" % (event.get_pid(),event.get_filename(),event.get_exit_code()))
-
     pid = event.get_pid()
     tid = event.get_tid()
-    
+
+    log("[*] <%d:%d> Exit process event for %s: %d" % (pid,tid,event.get_filename(),event.get_exit_code()))
+
     self.eventlog.append({
       "time": time.time(),
       "name": event.get_event_name(),
@@ -901,6 +903,7 @@ class MyEventHandler(winappdbg.EventHandler):
       "info": {
         "module_base": event.get_module_base(),
         "filename": event.get_filename(),
+        "exitcode": event.get_exit_code()
       },
     })
 
@@ -912,11 +915,66 @@ class MyEventHandler(winappdbg.EventHandler):
   ###
 
   def create_thread(self,event):
-    log("[*] Create thread event")
-
     pid = event.get_pid()
     tid = event.get_tid()
+
+    t = event.get_thread()
+    name = t.get_name()
     
+    log("[*] <%d:%d> Create thread event \"%s\" @ 0x%x" % (pid,tid,name,event.get_start_address()))
+
+    self.eventlog.append({
+      "time": time.time(),
+      "name": event.get_event_name(),
+      "type": "WinAppDbg Event",
+      "pid": pid,
+      "tid": tid,
+      "info": {
+        "startaddress": event.get_start_address(),
+        "threadname": name
+      },
+    })
+
+
+  ### D.4
+  # exit_thread
+  #
+  #     winappdbg defined callback function to handle thread exit events
+  ###
+
+  def exit_thread(self,event):
+    pid = event.get_pid()
+    tid = event.get_tid()
+
+    t = event.get_thread()
+    name = t.get_name()
+
+    log("[*] <%d:%d> Exit thread event \"%s\"" % (pid,tid,name,))
+
+    self.eventlog.append({
+      "time": time.time(),
+      "name": event.get_event_name(),
+      "type": "WinAppDbg Event",
+      "pid": pid,
+      "tid": tid,
+      "info": {
+        "threadname": name
+      },
+    })
+
+
+  ### D.5
+  # load_dll
+  #
+  #     winappdbg defined callback function to handle DLL load events
+  ###
+
+  def load_dll(self,event):
+    pid = event.get_pid()
+    tid = event.get_tid()
+
+    log("[*] <%d:%d> Load DLL event: %s" % (pid,tid,event.get_filename()))
+
     self.eventlog.append({
       "time": time.time(),
       "name": event.get_event_name(),
@@ -930,43 +988,17 @@ class MyEventHandler(winappdbg.EventHandler):
     })
 
 
-  ### D.4
-  # load_dll
-  #
-  #     winappdbg defined callback function to handle DLL load events
-  ###
-
-  def load_dll(self,event):
-    try:
-      log("[*] Load DLL: %s" % event.get_filename())
-
-      pid = event.get_pid()
-      tid = event.get_tid()
-
-      self.eventlog.append({
-        "time": time.time(),
-        "name": event.get_event_name(),
-        "type": "WinAppDbg Event",
-        "pid": pid,
-        "tid": tid,
-        "info": {
-          "module_base": event.get_module_base(),
-          "filename": event.get_filename(),
-        },
-      })
-    except:
-      traceback.print_exc()
-      raise
-
-
-  ### D.5
+  ### D.6
   # event
   #
   #     winappdbg defined callback function to handle any remaining events
   ###
 
   def event(self,event):
-    log("[*] Unhandled event: %s" % event.get_event_name())
+    pid = event.get_pid()
+    tid = event.get_tid()
+
+    log("[*] <%d:%d> Unhandled event: %s" % (pid,tid,event.get_event_name()))
 
 
 ###
@@ -1201,7 +1233,7 @@ def simple_debugger(filename):
     traceback.print_exc()
   with winappdbg.Debug(handler,bKillOnExit = True,bHostileCode = False) as debug:
     log("[*] Starting %s" % filename)
-    debug.execl(filename,bFollow = False)
+    debug.execl(filename,bFollow = True)
     log("[*] Starting debug loop")
     debug.loop()
     log("[*] Terminating")

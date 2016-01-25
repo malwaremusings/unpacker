@@ -11,6 +11,7 @@ WinAppDbg script to automate malware unpacking.
 - Dumps memory decompressed by RtlDecompressBuffer()
 - Attempts to detect process hollowing
   - Dumps injected memory blocks to a file
+- Dumps decrypted network traffic
 
 ## More information
 [Automated Unpacking: A Behaviour Based Approach](http://malwaremusings.com/2013/02/26/automated-unpacking-a-behaviour-based-approach/)
