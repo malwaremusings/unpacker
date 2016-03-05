@@ -864,7 +864,7 @@ class MyEventHandler(winappdbg.EventHandler):
     tid = event.get_tid()
     
     log("[*] <%d:%d> Create process event for pid %d (%s)" % (pid,tid,p.get_pid(),p.get_image_name()))
-    log("[-]   %s" % p.get_command_line())
+    log("[-]   command line: %s" % p.get_command_line())
     #log("[D]   Create process event for pid %d (%d)" % (pid,tid))
 
     self.eventlog.append({
@@ -892,7 +892,7 @@ class MyEventHandler(winappdbg.EventHandler):
     pid = event.get_pid()
     tid = event.get_tid()
 
-    log("[*] <%d:%d> Exit process event for %s: %d" % (pid,tid,event.get_filename(),event.get_exit_code()))
+    log("[*] <%d:%d> Exit process event for %s: 0x%x" % (pid,tid,event.get_filename(),event.get_exit_code()))
 
     self.eventlog.append({
       "time": time.time(),
@@ -1233,7 +1233,7 @@ def simple_debugger(filename):
     traceback.print_exc()
   with winappdbg.Debug(handler,bKillOnExit = True,bHostileCode = False) as debug:
     log("[*] Starting %s" % filename)
-    debug.execl(filename,bFollow = True)
+    debug.execl(filename,bFollow = False)
     log("[*] Starting debug loop")
     debug.loop()
     log("[*] Terminating")
